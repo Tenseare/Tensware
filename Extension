@@ -1,58 +1,427 @@
--- Lightweight speed controller
--- Integrate with your existing buttons and state flags.
+-- War Tycoon Mobile Sprint
+-- StarterPlayer > StarterPlayerScripts > LocalScript
+-- Aim + downed only. No crouch detection. No weapon scanning.
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+
 local NORMAL_SPEED = 16
 local AIM_SPEED = 14
-local CROUCH_SPEED = 8
-local MULTIPLIER = 2
+local DEFAULT_MULTIPLIER = 2
+local MIN_MULTIPLIER = 1
+local MAX_MULTIPLIER = 5
+local CHECK_INTERVAL = 0.25
+
 local sprintEnabled = false
-local aiming = false
-local crouching = false
-local downed = false
-local player = game:GetService("Players").LocalPlayer
-local humanoid
-local lastSpeed
-local function bindCharacter(character)
-    humanoid = character:WaitForChild("Humanoid")
-    lastSpeed = nil
+local multiplier = DEFAULT_MULTIPLIER
+local controlsVisible = true
+
+local character, humanoid
+local stateConnections = {}
+local trackedValues = {}
+local trackedAttributes = {}
+local lastAppliedSpeed
+
+local AIM_NAMES = {
+    "IsAiming", "Aiming", "IsAim", "Aim",
+    "Scoped", "IsScoped", "ADS", "IsADS",
+    "AimDownSights", "IsAimDownSights",
+    "AimingDownSights", "IsZoomed", "Zoomed",
+    "IsZooming", "Zooming", "AimMode"
+}
+
+local DOWNED_NAMES = {
+    "IsDowned", "Downed", "Down", "IsKnocked",
+    "Knocked", "KnockedDown", "IsKnockedDown",
+    "Incapacitated", "IsIncapacitated",
+    "IsUnconscious", "Unconscious",
+    "BeingCarried", "IsBeingCarried",
+    "IsRagdolled", "Ragdolled", "DownedState"
+}
+
+local function normalize(name)
+    return string.lower(tostring(name)):gsub("[^%w]", "")
 end
+
+local function matches(name, list)
+    name = normalize(name)
+    for _, candidate in ipairs(list) do
+        if name == normalize(candidate) then
+            return true
+        end
+    end
+    return false
+end
+
+local function classify(name)
+    if matches(name, AIM_NAMES) then
+        return "aim"
+    elseif matches(name, DOWNED_NAMES) then
+        return "downed"
+    end
+end
+
+local function isTrueValue(object)
+    if object:IsA("BoolValue") then
+        return object.Value
+    elseif object:IsA("NumberValue") or object:IsA("IntValue") then
+        return object.Value ~= 0
+    elseif object:IsA("StringValue") then
+        local value = normalize(object.Value)
+        return value == "true" or value == "yes"
+            or value == "1" or value == "active"
+            or value == "aiming" or value == "downed"
+            or value == "knocked"
+    end
+    return false
+end
+
+local function attributeIsTrue(value)
+    if typeof(value) == "boolean" then
+        return value
+    elseif typeof(value) == "number" then
+        return value ~= 0
+    elseif typeof(value) == "string" then
+        local v = normalize(value)
+        return v == "true" or v == "yes"
+            or v == "1" or v == "active"
+            or v == "aiming" or v == "downed"
+            or v == "knocked"
+    end
+    return false
+end
+
+local function trackObject(object)
+    local kind = classify(object.Name)
+    if kind and (
+        object:IsA("BoolValue")
+        or object:IsA("StringValue")
+        or object:IsA("NumberValue")
+        or object:IsA("IntValue")
+    ) then
+        trackedValues[object] = kind
+    end
+end
+
+local function trackAttributes(container)
+    local attributes = {}
+
+    for name in pairs(container:GetAttributes()) do
+        local kind = classify(name)
+        if kind then
+            attributes[name] = kind
+        end
+    end
+
+    trackedAttributes[container] = attributes
+end
+
+local function addContainer(container)
+    trackAttributes(container)
+
+    -- Scan only player/character at spawn, never equipped weapons.
+    for _, object in ipairs(container:GetDescendants()) do
+        trackObject(object)
+    end
+
+    table.insert(stateConnections, container.DescendantAdded:Connect(function(object)
+        trackObject(object)
+    end))
+
+    table.insert(stateConnections, container.DescendantRemoving:Connect(function(object)
+        trackedValues[object] = nil
+    end))
+
+    table.insert(stateConnections, container.AttributeChanged:Connect(function(name)
+        local kind = classify(name)
+        if kind then
+            trackedAttributes[container] = trackedAttributes[container] or {}
+            trackedAttributes[container][name] = kind
+        end
+    end))
+end
+
+local function clearTracking()
+    for _, connection in ipairs(stateConnections) do
+        connection:Disconnect()
+    end
+
+    table.clear(stateConnections)
+    table.clear(trackedValues)
+    table.clear(trackedAttributes)
+end
+
+local function readStates()
+    local aiming, downed = false, false
+
+    for object, kind in pairs(trackedValues) do
+        if object.Parent and isTrueValue(object) then
+            if kind == "aim" then
+                aiming = true
+            else
+                downed = true
+            end
+
+            if aiming and downed then
+                break
+            end
+        end
+    end
+
+    for container, attributes in pairs(trackedAttributes) do
+        if container.Parent then
+            for name, kind in pairs(attributes) do
+                if attributeIsTrue(container:GetAttribute(name)) then
+                    if kind == "aim" then
+                        aiming = true
+                    else
+                        downed = true
+                    end
+                end
+            end
+        end
+    end
+
+    return aiming, downed
+end
+
+-- UI
+local gui = Instance.new("ScreenGui")
+gui.Name = "WarTycoonSprintGui"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local function makeButton(name, text, size, position, parent)
+    local b = Instance.new("TextButton")
+    b.Name = name
+    b.Text = text
+    b.Size = size
+    b.Position = position
+    b.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.TextScaled = true
+    b.Font = Enum.Font.GothamBold
+    b.BorderSizePixel = 0
+    b.Active = true
+    b.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = b
+    return b
+end
+
+local sprintButton = makeButton(
+    "SprintButton", "SPRINT: OFF",
+    UDim2.fromOffset(145, 55),
+    UDim2.new(1, -165, 1, -180), gui
+)
+
+local menuButton = makeButton(
+    "MenuButton", "SPRINT MENU",
+    UDim2.fromOffset(135, 42),
+    UDim2.new(1, -155, 1, -235), gui
+)
+
+local menu = Instance.new("Frame")
+menu.Name = "SprintMenu"
+menu.Size = UDim2.fromOffset(230, 190)
+menu.Position = UDim2.new(1, -250, 1, -430)
+menu.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+menu.BorderSizePixel = 0
+menu.Active = true
+menu.Visible = false
+menu.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = menu
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 35)
+title.BackgroundTransparency = 1
+title.Text = "Sprint Settings (Drag Here)"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.TextScaled = true
+title.Font = Enum.Font.GothamBold
+title.Parent = menu
+
+local multiplierLabel = Instance.new("TextLabel")
+multiplierLabel.Size = UDim2.new(1, -20, 0, 30)
+multiplierLabel.Position = UDim2.fromOffset(10, 42)
+multiplierLabel.BackgroundTransparency = 1
+multiplierLabel.TextColor3 = Color3.new(1, 1, 1)
+multiplierLabel.TextScaled = true
+multiplierLabel.Parent = menu
+
+local minusButton = makeButton(
+    "DecreaseMultiplier", "-",
+    UDim2.fromOffset(55, 38),
+    UDim2.fromOffset(15, 80), menu
+)
+
+local plusButton = makeButton(
+    "IncreaseMultiplier", "+",
+    UDim2.fromOffset(55, 38),
+    UDim2.new(1, -70, 0, 80), menu
+)
+
+local visibilityButton = makeButton(
+    "VisibilityButton", "HIDE CONTROLS",
+    UDim2.new(1, -20, 0, 35),
+    UDim2.fromOffset(10, 135), menu
+)
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -20, 0, 25)
+statusLabel.Position = UDim2.new(0, 10, 1, -28)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.fromRGB(190, 190, 190)
+statusLabel.TextScaled = true
+statusLabel.Parent = menu
+
+local function updateUI()
+    sprintButton.Text = sprintEnabled and "SPRINT: ON" or "SPRINT: OFF"
+    sprintButton.BackgroundColor3 = sprintEnabled
+        and Color3.fromRGB(20, 125, 55)
+        or Color3.fromRGB(35, 35, 35)
+
+    multiplierLabel.Text = string.format(
+        "Multiplier: %.2fx | Speed: %.1f",
+        multiplier, NORMAL_SPEED * multiplier
+    )
+
+    visibilityButton.Text = controlsVisible
+        and "HIDE CONTROLS" or "SHOW CONTROLS"
+end
+
+local function makeDraggable(object, handle)
+    handle = handle or object
+    local dragging = false
+    local dragStart
+    local startPosition
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPosition = object.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local delta = input.Position - dragStart
+            object.Position = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+makeDraggable(sprintButton)
+makeDraggable(menuButton)
+makeDraggable(menu, title)
+
+local function bindCharacter(newCharacter)
+    clearTracking()
+
+    character = newCharacter
+    humanoid = character:WaitForChild("Humanoid")
+    lastAppliedSpeed = nil
+    sprintEnabled = false
+
+    addContainer(player)
+    addContainer(character)
+
+    updateUI()
+end
+
 player.CharacterAdded:Connect(bindCharacter)
 if player.Character then
     task.spawn(bindCharacter, player.Character)
 end
--- Call this from your existing aim/crouch/downed detection
--- whenever a state changes. Do not scan descendants here.
-local function updateSpeed()
-    if not humanoid or humanoid.Health <= 0 or downed then
-        lastSpeed = nil
-        return
-    end
-    local target
-    if aiming then
-        target = AIM_SPEED
-    elseif crouching then
-        target = CROUCH_SPEED
-    elseif sprintEnabled then
-        target = NORMAL_SPEED * MULTIPLIER
-    else
-        target = NORMAL_SPEED
-    end
-    if target ~= lastSpeed then
-        humanoid.WalkSpeed = target
-        lastSpeed = target
-    end
-end
--- Poll only for character availability; speed changes are event-driven.
+
+sprintButton.Activated:Connect(function()
+    sprintEnabled = not sprintEnabled
+    lastAppliedSpeed = nil
+    updateUI()
+end)
+
+menuButton.Activated:Connect(function()
+    menu.Visible = not menu.Visible
+end)
+
+minusButton.Activated:Connect(function()
+    multiplier = math.max(MIN_MULTIPLIER, multiplier - 0.25)
+    lastAppliedSpeed = nil
+    updateUI()
+end)
+
+plusButton.Activated:Connect(function()
+    multiplier = math.min(MAX_MULTIPLIER, multiplier + 0.25)
+    lastAppliedSpeed = nil
+    updateUI()
+end)
+
+visibilityButton.Activated:Connect(function()
+    controlsVisible = not controlsVisible
+    sprintButton.Visible = controlsVisible
+    menuButton.Visible = controlsVisible
+    menu.Visible = controlsVisible and menu.Visible
+    updateUI()
+end)
+
+-- Only poll cached states four times per second.
 task.spawn(function()
-    while true do
-        task.wait(1)
-        if humanoid and humanoid.Parent then
-            updateSpeed()
+    while gui.Parent do
+        task.wait(CHECK_INTERVAL)
+
+        if not humanoid or not humanoid.Parent or humanoid.Health <= 0 then
+            continue
+        end
+
+        local aiming, downed = readStates()
+
+        if downed then
+            statusLabel.Text = "DOWNED"
+            lastAppliedSpeed = nil
+            continue
+        end
+
+        local targetSpeed
+        if aiming then
+            targetSpeed = AIM_SPEED
+            statusLabel.Text = "AIMING"
+        elseif sprintEnabled then
+            targetSpeed = NORMAL_SPEED * multiplier
+            statusLabel.Text = "SPRINTING"
+        else
+            targetSpeed = NORMAL_SPEED
+            statusLabel.Text = "NORMAL"
+        end
+
+        if targetSpeed ~= lastAppliedSpeed
+            or math.abs(humanoid.WalkSpeed - targetSpeed) > 0.1 then
+            humanoid.WalkSpeed = targetSpeed
+            lastAppliedSpeed = targetSpeed
         end
     end
 end)
--- Connect your sprint button to:
--- sprintEnabled = not sprintEnabled
--- updateSpeed()
---
--- Update aiming/crouching/downed variables when their actual
--- game state changes, then call updateSpeed().
+
+updateUI()
